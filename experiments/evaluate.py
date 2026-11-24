@@ -1,4 +1,7 @@
-"""Load the trained model and compare it with a random agent on every game."""
+"""Load a trained model and compare it with a random agent on every game.
+
+    uv run python -m experiments.evaluate results\\some_model.pt
+"""
 
 import sys
 
@@ -10,36 +13,62 @@ from agents.ppo import to_tensor
 from experiments.train import GAMES
 
 
-def play(env, choose, episodes):
-    total = 0.0
-    for _ in range(episodes):
-        obs, done = env.reset(), False
-        while not done:
-            obs, reward, terminated, truncated = env.step(choose(obs))
-            total += reward
-            done = terminated or truncated
-    return total / episodes
-
-
-def main(path="results/multigame_small.pt", episodes=200):
-    saved = torch.load(path)
+def load_model(path):
+    saved = torch.load(path, weights_only=True)
     net = SmallMultiGameNet()
     net.load_state_dict(saved["model"])
     net.eval()
-    rng = np.random.default_rng(123)
+    return net, saved
 
-    print(f"{'game':<8}{'random':>10}{'trained':>10}")
-    for name in saved["config"]["games"]:
-        env = GAMES[name](seed=999)  # a seed not used in training
-        mask = to_tensor(env.action_mask()[None], torch.bool)
 
-        def model_move(obs):
+def evaluate_policy(net, game, episodes=200, seed=999, mode="greedy", policy="model"):
+    """Play `episodes` games side by side (one batched forward pass per step).
+
+    Episode i always uses seed + i, so the model and the random agent face the same games.
+    mode: "greedy" (best move) or "sample" (roll the dice like training).
+    policy: "model" or "random".
+    """
+    from experiments.baselines import SUCCESS_EVENTS
+
+    envs = [GAMES[game](seed=seed + i) for i in range(episodes)]
+    obs = np.stack([e.reset() for e in envs])
+    mask = to_tensor(np.stack([e.action_mask() for e in envs]), torch.bool)
+    returns = np.zeros(episodes)
+    lengths = np.zeros(episodes, dtype=int)
+    success = np.zeros(episodes, dtype=bool)
+    active = np.ones(episodes, dtype=bool)
+    rng = np.random.default_rng(seed)
+    generator = torch.Generator().manual_seed(seed)
+
+    while active.any():
+        idx = np.flatnonzero(active)
+        if policy == "random":
+            actions = [int(rng.choice(envs[i].valid_actions)) for i in idx]
+        else:
             with torch.no_grad():
-                logits, _ = net(to_tensor(obs[None]), mask)
-            return int(logits.argmax())  # best move, no randomness
+                logits, _ = net(to_tensor(obs[idx]), mask[idx])
+            if mode == "greedy":
+                actions = logits.argmax(-1).tolist()
+            else:
+                probs = torch.softmax(logits, -1)
+                actions = torch.multinomial(probs, 1, generator=generator).squeeze(-1).tolist()
+        for i, a in zip(idx, actions):
+            o, r, terminated, truncated = envs[i].step(int(a))
+            returns[i] += r
+            lengths[i] += 1
+            obs[i] = o
+            if terminated or truncated:
+                active[i] = False
+                success[i] = envs[i].last_event in SUCCESS_EVENTS
+    return {"returns": returns, "lengths": lengths, "success": success}
 
-        random_score = play(env, lambda obs: int(rng.choice(env.valid_actions)), episodes)
-        trained_score = play(env, model_move, episodes)
+
+def main(path="results/multigame_small.pt", episodes=200):
+    net, _ = load_model(path)
+    print(f"{'game':<8}{'random':>10}{'trained':>10}")
+    for name in GAMES:
+        random_score = evaluate_policy(net, name, episodes, policy="random")["returns"].mean()
+        trained_score = evaluate_policy(net, name, episodes)["returns"].mean()
         print(f"{name:<8}{random_score:>10.2f}{trained_score:>10.2f}")
 
 

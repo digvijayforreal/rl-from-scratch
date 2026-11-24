@@ -18,6 +18,7 @@
       </div>
     </div>
     <div id="status-pill" class="status-pill" role="status" aria-live="polite">Connecting…</div>
+    <button id="job-pill" class="job-pill" type="button" hidden title="Open the Experiments tab"></button>
     <nav class="controls" aria-label="Training controls">
       <button id="btn-start" class="btn primary" type="button">▶ Start</button>
       <button id="btn-pause" class="btn" type="button">❚❚ Pause</button>
@@ -27,7 +28,15 @@
     </nav>
   </header>
 
+  <nav class="tabs" role="tablist" aria-label="Lab sections">
+    <button type="button" role="tab" id="tabbtn-train" aria-controls="tab-train" aria-selected="true" data-tab="train">◉ Train</button>
+    <button type="button" role="tab" id="tabbtn-test" aria-controls="tab-test" aria-selected="false" data-tab="test">✓ Test</button>
+    <button type="button" role="tab" id="tabbtn-experiments" aria-controls="tab-experiments" aria-selected="false" data-tab="experiments">⚗ Experiments</button>
+    <button type="button" role="tab" id="tabbtn-runs" aria-controls="tab-runs" aria-selected="false" data-tab="runs">☰ Run history</button>
+  </nav>
+
   <main id="main">
+  <section id="tab-train" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-train">
     <!-- Key numbers -->
     <section class="kpis" aria-label="Key numbers">
       <div class="kpi"><span class="kpi-label">Update</span><span class="kpi-value" id="kpi-update">0</span><span class="kpi-sub" id="kpi-update-sub">of 0</span></div>
@@ -171,6 +180,144 @@
         <ul id="checkpoints" class="checkpoints"></ul>
       </div>
     </section>
+  </section>
+
+  <!-- ================= TEST ================= -->
+  <section id="tab-test" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-test" hidden>
+    <section class="row lab-two">
+      <div class="panel">
+        <div class="panel-head"><h2>Test a brain</h2></div>
+        <p class="explain">Plays many brand-new games of every game with no learning, and compares the brain with a random agent on <b>exactly the same games</b>. This is the fair score to report, unlike the training score.</p>
+        <form id="test-form" class="lab-form">
+          <label class="full">Brain
+            <select id="test-brain" name="checkpoint"></select>
+          </label>
+          <label>Games per game <input name="episodes" type="number" min="10" max="1000" value="200"></label>
+          <label>Test seed <input name="seed" type="number" min="0" max="1000000" value="999"></label>
+          <label class="full">Move choice
+            <select name="mode">
+              <option value="greedy">Best move (deterministic)</option>
+              <option value="sample">Sample from probabilities</option>
+            </select>
+          </label>
+          <button type="submit" class="btn primary full" id="test-run">Run test</button>
+        </form>
+        <p id="test-status" class="muted" aria-live="polite"></p>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Results <span class="tag" id="test-label">no test yet</span></h2></div>
+        <p class="explain">"Skill" = how far the brain is from random (0%) to perfect (100%). The histograms show every game's score: the brain in color, random in grey.</p>
+        <div id="test-results" class="test-results"><p class="muted">Run a test to see results.</p></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Replay one game, move by move</h2>
+        <form id="replay-form" class="inline-controls">
+          <label>Brain <select id="replay-brain"></select></label>
+          <label>Game <select id="replay-game"></select></label>
+          <label>Seed <input id="replay-seed" type="number" min="0" max="1000000" value="1" style="width:90px"></label>
+          <select id="replay-mode" aria-label="Move choice"><option value="greedy">Best move</option><option value="sample">Sample</option></select>
+          <button type="submit" class="btn primary small">Record</button>
+        </form>
+      </div>
+      <p class="explain">Records one full game, then lets you step through it. At every step you see the board, what the brain was thinking and the move it made. Change the seed for a different game.</p>
+      <div class="replay">
+        <div class="replay-game">
+          <canvas id="replay-canvas" class="game-canvas" role="img" aria-label="Recorded game replay"></canvas>
+          <div class="replay-controls" role="group" aria-label="Replay controls">
+            <button type="button" class="btn small" data-step="first" aria-label="First step">⏮</button>
+            <button type="button" class="btn small" data-step="prev" aria-label="Previous step">◀</button>
+            <button type="button" class="btn small" data-step="play" id="replay-play" aria-label="Play or pause">▶</button>
+            <button type="button" class="btn small" data-step="next" aria-label="Next step">▶|</button>
+            <button type="button" class="btn small" data-step="last" aria-label="Last step">⏭</button>
+            <input id="replay-slider" type="range" min="0" max="0" value="0" aria-label="Replay position">
+          </div>
+          <div id="replay-info" class="replay-info muted">Press Record.</div>
+        </div>
+        <div class="brain-wrap replay-brain">
+          <canvas id="replay-brain-canvas" class="brain-canvas" role="img" aria-label="Brain activity at the selected replay step"></canvas>
+          <div id="replay-tooltip" class="tooltip" hidden></div>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <!-- ================= EXPERIMENTS ================= -->
+  <section id="tab-experiments" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-experiments" hidden>
+    <section class="row lab-two">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>New plasticity experiment</h2>
+          <div class="inline-controls">
+            <button type="button" class="btn small" data-preset="quick">Quick test preset</button>
+            <button type="button" class="btn small" data-preset="default">Standard preset</button>
+          </div>
+        </div>
+        <p class="explain">The question: <b>does a brain that already learned phase A learn phase B slower than a fresh brain, and does it forget A?</b> For every seed, one brain trains on A, then copies of it (one per fix you tick) train on B. A fresh brain with the same starting weights trains on B too, as the comparison.</p>
+        <form id="exp-form" class="lab-form">
+          <label class="full">Name <input name="name" maxlength="60" required></label>
+          <fieldset class="full chips"><legend>Phase A: learn first</legend><div id="exp-phase-a"></div></fieldset>
+          <fieldset class="full chips"><legend>Phase B: then learn</legend><div id="exp-phase-b"></div></fieldset>
+          <label>Phase A moves <input name="steps_a" type="number" step="10000"></label>
+          <label>Phase B moves <input name="steps_b" type="number" step="10000"></label>
+          <label>Seeds <input name="seeds" type="number" min="1" max="10"><small>More seeds = more trustworthy</small></label>
+          <label>Test every N updates <input name="eval_every" type="number"></label>
+          <fieldset class="full chips"><legend>Fixes to try at the switch</legend><div id="exp-interventions"></div></fieldset>
+          <details class="full">
+            <summary>Advanced</summary>
+            <div class="lab-form inner">
+              <label>Test games per check <input name="eval_episodes" type="number"></label>
+              <label>Copies per game <input name="envs_per_game" type="number"></label>
+              <label>Learning rate <input name="lr" type="number" step="any"></label>
+              <label>Entropy bonus <input name="ent_coef" type="number" step="any"></label>
+            </div>
+          </details>
+          <p id="exp-estimate" class="full estimate"></p>
+          <button type="submit" class="btn primary full">Add to queue</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Queue</h2></div>
+        <p class="explain">One job runs at a time, at full speed. A job waits while live training is running on the Train tab, since both would share your CPU.</p>
+        <ul id="job-list" class="job-list"><li class="muted job-empty">No experiments queued.</li></ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Results</h2>
+        <div class="inline-controls">
+          <label>Experiment <select id="exp-select"><option value="">—</option></select></label>
+          <a id="exp-export" class="btn small" href="#" download hidden>⤓ Export CSV</a>
+        </div>
+      </div>
+      <div id="exp-header" class="exp-header muted">Choose an experiment.</div>
+      <div id="exp-verdict" class="verdict" hidden></div>
+      <div class="table-wrap"><table class="data" id="exp-table" hidden></table></div>
+      <p class="explain">Shaded areas are ≈95% intervals across seeds. "Learning speed vs fresh" is the area under the learning curve divided by the fresh brain's: below 1 means the experienced brain learned slower (plasticity loss), above 1 means it learned faster (transfer). Intervals come from a bootstrap over seeds.</p>
+      <div id="exp-charts" class="charts"></div>
+      <div class="notes-box" id="exp-notes-box" hidden>
+        <label for="exp-notes">Lab notes for this experiment</label>
+        <textarea id="exp-notes" rows="4" placeholder="What did you expect? What happened? What's next?"></textarea>
+        <button type="button" class="btn small" id="exp-notes-save">Save notes</button>
+      </div>
+    </section>
+  </section>
+
+  <!-- ================= RUN HISTORY ================= -->
+  <section id="tab-runs" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-runs" hidden>
+    <section class="panel">
+      <div class="panel-head"><h2>Training runs</h2><button type="button" class="btn small" id="runs-refresh">Refresh</button></div>
+      <p class="explain">Every run started on the Train tab is saved in <code>results/runs/</code> with its settings, a CSV of every update, and its checkpoints. Write notes as you go: this is your lab notebook.</p>
+      <div id="runs-list" class="runs-list"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Experiments</h2></div>
+      <div id="exps-list" class="runs-list"></div>
+    </section>
+  </section>
   </main>
 
   <div id="toast" class="toast" role="alert" hidden></div>
@@ -179,5 +326,6 @@
   <script src="/js/games.js"></script>
   <script src="/js/brain.js"></script>
   <script src="/js/app.js"></script>
+  <script src="/js/lab.js"></script>
 </body>
 </html>

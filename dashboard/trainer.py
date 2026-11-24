@@ -1,26 +1,27 @@
 """Background PPO trainer and live 'showcase' player for the dashboard.
 
-Trainer  : runs the same PPO loop as experiments/train.py in a thread, and
-           records everything the dashboard shows (scores, losses, brain stats).
-Showcase : plays one copy of every game at human speed with the latest
-           weights, so you can watch the agent improve while it trains.
+Trainer  : runs the same PPO loop as experiments/train.py in a thread, records everything
+           the dashboard shows, and saves each run to results/runs/<run_id>/.
+Showcase : plays one copy of every game at human speed with the latest weights, so you
+           can watch the agent improve while it trains.
 """
 
+import csv
 import math
 import threading
 import time
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 import torch
 
+from agents.metrics import plasticity_metrics
 from agents.network import LAYER_NAMES, SmallMultiGameNet, count_parameters
 from agents.ppo import RolloutCollector, compute_gae, ppo_update, to_tensor
-from envs.base import ACTION_NAMES, AGENT, CHANNEL_NAMES, GOAL, GRID, ITEM, NUM_ACTIONS
+from dashboard import storage
+from envs.base import ACTION_NAMES, AGENT, CHANNEL_NAMES, GOAL, GRID, ITEM
+from experiments.baselines import SUCCESS_EVENTS, optimal_score, random_baseline
 from experiments.train import CONFIG, GAMES, make_envs
-
-RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 # Settings the dashboard may change, with (type, min, max).
 CONFIG_LIMITS = {
@@ -37,17 +38,20 @@ CONFIG_LIMITS = {
     "seed": (int, 0, 10_000),
 }
 
-SUCCESS_EVENTS = {"catch", "goal"}
-
 
 class StopTraining(Exception):
     pass
 
 
 def clean(x):
-    """Make a value JSON-safe (no NaN or infinity)."""
-    if isinstance(x, float):
+    """Make a value JSON-safe (no NaN or infinity, numpy numbers become Python numbers)."""
+    if isinstance(x, (float, np.floating)):
+        x = float(x)
         return x if math.isfinite(x) else None
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.bool_):
+        return bool(x)
     if isinstance(x, dict):
         return {k: clean(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
@@ -75,32 +79,25 @@ def sanitize_config(updates, base):
     return cfg
 
 
-def random_baseline(name, episodes=400, seed=4242):
-    """Average return of random valid moves (the 'zero skill' line on the chart)."""
-    env = GAMES[name](seed=seed)
-    rng = np.random.default_rng(seed)
-    total = 0.0
-    for _ in range(episodes):
-        env.reset()
-        done = False
-        while not done:
-            _, r, term, trunc = env.step(int(rng.choice(env.valid_actions)))
-            total += r
-            done = term or trunc
-    return total / episodes
-
-
-def optimal_score(name):
-    """Best possible average return, worked out exactly."""
-    if name == "catch":
-        return 1.0  # the paddle can always reach the ball in time
-    if name == "reach":
-        # Shortest path = Manhattan distance d; return = 1 - 0.01 * (d - 1). Average over all start/goal pairs.
-        cells = [(r, c) for r in range(GRID) for c in range(GRID)]
-        scores = [1 - 0.01 * (abs(a[0] - b[0]) + abs(a[1] - b[1]) - 1)
-                  for a in cells for b in cells if a != b]
-        return float(np.mean(scores))
-    return None
+def build_frame(*, seq, game, episode, step, before, after, action, probs, value, reward,
+                ep_return, event, valid, version, acts=None, obs=None, done=False, reset=False,
+                recent_return=None, success_rate=None):
+    """One moment of a game, in the format the dashboard draws (live player and replays)."""
+    frame = {
+        "seq": seq, "game": game, "episode": episode, "step": step,
+        "prev": before, "state": after, "reset": reset, "done": done, "event": event,
+        "action": action, "action_name": None if action is None else ACTION_NAMES[action],
+        "valid": valid,
+        "probs": None if probs is None else rounded(probs, 4),
+        "value": None if value is None else float(value),
+        "reward": reward, "ep_return": round(ep_return, 3),
+        "recent_return": recent_return, "success_rate": success_rate,
+        "weights_version": version,
+    }
+    if acts is not None:
+        frame["obs"] = obs.astype(np.int8).ravel().tolist()
+        frame["acts"] = {name: rounded(a, 3) for name, a in acts.items()}
+    return clean(frame)
 
 
 class Trainer:
@@ -113,10 +110,11 @@ class Trainer:
         self.delay_ms = 0                   # slow-motion: pause this long after every move
         self.version = 0                    # increases whenever the weights change
         self.run_id = 0
-        self.events = []                    # (id, kind, text) log shown on the dashboard
+        self.events = []                    # log shown on the dashboard
         self.games = list(CONFIG["games"])
         self.baselines = {g: {"random": random_baseline(g), "optimal": optimal_score(g)}
                           for g in self.games}
+        self.run_dir = None
         self.build(dict(CONFIG))
 
     # ---------- setup ----------
@@ -134,6 +132,7 @@ class Trainer:
         self.num_params = count_parameters(self.net)
 
         self.run_id += 1
+        self.run_dir = None  # created when training starts
         self.status = "idle"
         self.phase = "idle"
         self.phase_progress = 0.0
@@ -156,6 +155,31 @@ class Trainer:
         self.events.append({"id": len(self.events), "kind": kind, "text": text,
                             "time": time.strftime("%H:%M:%S")})
 
+    # ---------- run folder ----------
+
+    def _ensure_run_dir(self):
+        if self.run_dir is not None:
+            return
+        run_name = f"train_{time.strftime('%Y%m%d-%H%M%S')}_s{self.cfg['seed']}"
+        self.run_dir = storage.RUNS_DIR / run_name
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        storage.write_json(self.run_dir / "config.json", self.cfg)
+        storage.write_json(self.run_dir / "meta.json", {
+            "id": run_name, "kind": "run", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "notes": "", "games": self.games, "config": self.cfg, "params": self.num_params})
+        self.log("info", f"Saving this run to results/runs/{run_name}/")
+
+    def _write_meta(self):
+        if self.run_dir is None:
+            return
+        path = self.run_dir / "meta.json"
+        meta = storage.read_json(path, default={}) or {}  # keep notes the user wrote
+        last = self.history[-1] if self.history else {}
+        meta.update(status=self.status, update=self.update, num_updates=self.num_updates,
+                    env_steps=self.env_steps, minutes=round(self.active_time / 60, 2),
+                    scores={g: last.get(f"score_{g}") for g in self.games})
+        storage.write_json(path, clean(meta))
+
     # ---------- controls ----------
 
     def start(self):
@@ -163,9 +187,11 @@ class Trainer:
             return self.resume()
         if self.status != "idle":
             return
+        self._ensure_run_dir()
         self.stop_flag = False
         self.resume_event.set()
         self.status = "running"
+        self._write_meta()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.log("info", "Training started.")
@@ -174,12 +200,14 @@ class Trainer:
         if self.status == "running":
             self.resume_event.clear()
             self.status = "paused"
+            self._write_meta()
             self.log("info", f"Paused at update {self.update}.")
 
     def resume(self):
         if self.status == "paused":
             self.status = "running"
             self.resume_event.set()
+            self._write_meta()
             self.log("info", "Resumed.")
 
     def reset(self, updates=None):
@@ -188,38 +216,31 @@ class Trainer:
         if self.thread is not None:
             self.thread.join(timeout=30)
         self.thread = None
+        if self.run_dir is not None and self.status != "finished":
+            self.status = "stopped"
+            self._write_meta()
         self.build(sanitize_config(updates, self.cfg))
 
     def save(self):
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = RESULTS_DIR / f"dashboard_u{self.update:04d}_{time.strftime('%Y%m%d-%H%M%S')}.pt"
+        self._ensure_run_dir()
+        path = self.run_dir / f"u{self.update:04d}.pt"
         with self.lock:
             torch.save({"model": self.net.state_dict(), "config": self.cfg,
                         "update": self.update, "env_steps": self.env_steps}, path)
-        self.log("success", f"Saved checkpoint {path.name}")
-        return path.name
-
-    def list_checkpoints(self):
-        if not RESULTS_DIR.exists():
-            return []
-        files = sorted(RESULTS_DIR.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return [{"name": p.name, "size_kb": round(p.stat().st_size / 1024, 1),
-                 "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))}
-                for p in files]
+        name = path.relative_to(storage.RESULTS_DIR).as_posix()
+        self.log("success", f"Saved checkpoint {name}")
+        return name
 
     def load(self, name):
-        """Load weights from results/ into the current network (training must not be running)."""
+        """Load weights into the current network (training must not be running)."""
         if self.status == "running":
             raise ValueError("Pause training before loading a checkpoint.")
-        safe_name = Path(str(name)).name  # no folders, so nothing outside results/ can be read
-        path = RESULTS_DIR / safe_name
-        if path.suffix != ".pt" or not path.is_file():
-            raise ValueError(f"Checkpoint {safe_name} not found.")
+        path = storage.resolve_checkpoint(name)
         saved = torch.load(path, weights_only=True)
         with self.lock:
             self.net.load_state_dict(saved["model"])
             self._publish(grad_norm=None, weight_change=None)
-        self.log("success", f"Loaded {safe_name}. The live players now use these weights.")
+        self.log("success", f"Loaded {name}. The live players now use these weights.")
 
     # ---------- training loop ----------
 
@@ -237,10 +258,9 @@ class Trainer:
                     self.phase, self.phase_progress = "collect", 0.0
                     batch, last_value = self.collector.collect(self.net, cfg["rollout_steps"],
                                                                on_step=self._on_step)
-                    self.phase, self.phase_progress = "advantage", 0.0
+                    self.phase, self.phase_progress = "advantage", 1.0
                     advantages, returns = compute_gae(batch["reward"], batch["value"], batch["done"],
                                                       last_value, cfg["gamma"], cfg["lam"])
-                    self.phase_progress = 1.0
                     self.phase, self.phase_progress = "update", 0.0
                     before = {n: getattr(self.net, n).weight.detach().clone() for n in LAYER_NAMES}
                     self._grad_sums = {n: 0.0 for n in LAYER_NAMES}
@@ -252,7 +272,8 @@ class Trainer:
                     for n in LAYER_NAMES:
                         w = getattr(self.net, n).weight.detach()
                         change[n] = float((w - before[n]).norm() / (before[n].norm() + 1e-12))
-                    plasticity = self._plasticity(batch["obs"])
+                    obs = batch["obs"].reshape(-1, *batch["obs"].shape[2:])
+                    plasticity = plasticity_metrics(self.net, obs)
                     self._publish(grad_norm=grad_norm, weight_change=change)
 
                 duration = time.time() - self.update_started
@@ -266,11 +287,13 @@ class Trainer:
                 self.status, self.phase = "finished", "idle"
                 self.log("success", "Training finished.")
                 self.save()
+                self._write_meta()
         except StopTraining:
             pass
         except Exception as exc:  # show the error on the dashboard instead of dying silently
             self.status, self.phase = "error", "idle"
             self.log("warn", f"Training crashed: {exc!r}")
+            self._write_meta()
             raise
 
     def _on_step(self, t, actions, probs):
@@ -305,26 +328,6 @@ class Trainer:
 
     # ---------- brain statistics ----------
 
-    def _plasticity(self, obs_batch):
-        """Dormant neurons (Sokar et al., 2023) and effective feature rank (Kumar et al., 2021)."""
-        obs = obs_batch.reshape(-1, *obs_batch.shape[2:])
-        obs = obs[torch.randperm(obs.shape[0])[:512]]
-        mask = torch.ones(obs.shape[0], NUM_ACTIONS, dtype=torch.bool)
-        with torch.no_grad():
-            _, _, acts = self.net(obs, mask, return_activations=True)
-        out = {}
-        for name, a in acts.items():
-            score = a.abs().mean(dim=(0, 2, 3)) if a.dim() == 4 else a.abs().mean(dim=0)
-            normalized = score / (score.mean() + 1e-8)
-            out[f"dormant_{name}"] = float((normalized <= 0.025).float().mean())
-        s = torch.linalg.svdvals(acts["fc"])
-        if float(s.sum()) > 0:
-            cumulative = torch.cumsum(s, 0) / s.sum()
-            out["eff_rank"] = int((cumulative < 0.99).sum()) + 1
-        else:
-            out["eff_rank"] = 0
-        return out
-
     def _publish(self, grad_norm, weight_change):
         """Share a copy of the weights with the live players, plus brain stats for the dashboard."""
         net = self.net
@@ -356,7 +359,18 @@ class Trainer:
         for g in self.games:
             recent = [r for name, r in self.collector.finished if name == g][-100:]
             row[f"score_{g}"] = float(np.mean(recent)) if recent else None
-        self.history.append(clean(row))
+        row = clean(row)
+        self.history.append(row)
+        if self.run_dir is not None:
+            path = self.run_dir / "log.csv"
+            new = not path.exists()
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new:
+                    writer.writeheader()
+                writer.writerow(row)
+            if self.update % 10 == 0:
+                self._write_meta()
         self._check_milestones(row)
 
     def _check_milestones(self, row):
@@ -428,6 +442,12 @@ class Showcase:
                 time.sleep(1)
             time.sleep(max(0.0, 1 / self.fps - (time.time() - started)))
 
+    def _stats(self, g):
+        results = self.results[g]
+        if not results:
+            return None, None
+        return float(np.mean([r for r, _ in results])), float(np.mean([s for _, s in results]))
+
     def _tick(self, g, env):
         self.seq += 1
         if self.needs_reset[g]:
@@ -436,8 +456,12 @@ class Showcase:
             self.episode[g] += 1
             self.needs_reset[g] = False
             state = env.state()
-            self.frames[g] = self._frame(g, env, state, state, None, None, None, 0.0,
-                                         reset=True)
+            recent, rate = self._stats(g)
+            self.frames[g] = build_frame(
+                seq=self.seq, game=g, episode=self.episode[g], step=0, before=state, after=state,
+                action=None, probs=None, value=None, reward=0.0, ep_return=0.0, event=None,
+                valid=env.valid_actions, version=self.version, reset=True,
+                recent_return=recent, success_rate=rate)
             return
 
         obs = self.obs[g]
@@ -453,32 +477,17 @@ class Showcase:
         before = env.state()
         self.obs[g], reward, terminated, truncated = env.step(action)
         self.ep_return[g] += reward
-        if terminated or truncated:
+        done = terminated or truncated
+        if done:
             self.needs_reset[g] = True
             self.results[g].append((self.ep_return[g], env.last_event in SUCCESS_EVENTS))
-        self.frames[g] = self._frame(g, env, before, env.state(), action, probs, value, reward,
-                                     acts=acts, obs=obs, done=terminated or truncated)
-
-    def _frame(self, g, env, before, after, action, probs, value, reward,
-               acts=None, obs=None, done=False, reset=False):
-        results = self.results[g]
-        frame = {
-            "seq": self.seq, "game": g, "episode": self.episode[g], "step": env.steps,
-            "prev": before, "state": after, "reset": reset, "done": done,
-            "event": None if reset else env.last_event,
-            "action": action, "action_name": None if action is None else ACTION_NAMES[action],
-            "valid": env.valid_actions,
-            "probs": None if probs is None else rounded(probs, 4),
-            "value": None if value is None else float(value[0]),
-            "reward": reward, "ep_return": round(self.ep_return[g], 3),
-            "recent_return": float(np.mean([r for r, _ in results])) if results else None,
-            "success_rate": float(np.mean([s for _, s in results])) if results else None,
-            "weights_version": self.version,
-        }
-        if acts is not None:
-            frame["obs"] = obs.astype(np.int8).ravel().tolist()
-            frame["acts"] = {name: rounded(a, 3) for name, a in acts.items()}
-        return clean(frame)
+        recent, rate = self._stats(g)
+        self.frames[g] = build_frame(
+            seq=self.seq, game=g, episode=self.episode[g], step=env.steps, before=before,
+            after=env.state(), action=action, probs=probs, value=value[0], reward=reward,
+            ep_return=self.ep_return[g], event=env.last_event, valid=env.valid_actions,
+            version=self.version, acts=acts, obs=obs, done=done,
+            recent_return=recent, success_rate=rate)
 
 
 def init_payload(trainer):

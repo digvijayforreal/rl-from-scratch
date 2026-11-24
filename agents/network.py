@@ -17,15 +17,17 @@ class SmallMultiGameNet(nn.Module):
         self.policy = nn.Linear(128, NUM_ACTIONS)  # one score per action
         self.value = nn.Linear(128, 1)             # how good this state is
 
-        # Orthogonal init (standard for PPO). A tiny policy head makes every
-        # allowed action almost equally likely at the start, so the agent explores.
-        for layer in (self.conv1, self.conv2, self.fc):
-            nn.init.orthogonal_(layer.weight, gain=2 ** 0.5)
+        self.reinit(LAYER_NAMES)
+
+    def reinit(self, names):
+        """Orthogonal init (standard for PPO). A tiny policy head makes every allowed
+        action almost equally likely at the start, so the agent explores.
+        Also used by experiments to reset chosen layers."""
+        gains = {"conv1": 2 ** 0.5, "conv2": 2 ** 0.5, "fc": 2 ** 0.5, "policy": 0.01, "value": 1.0}
+        for name in names:
+            layer = getattr(self, name)
+            nn.init.orthogonal_(layer.weight, gain=gains[name])
             nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.policy.weight, gain=0.01)
-        nn.init.zeros_(self.policy.bias)
-        nn.init.orthogonal_(self.value.weight, gain=1.0)
-        nn.init.zeros_(self.value.bias)
 
     def forward(self, obs, mask, return_activations=False):
         a1 = torch.relu(self.conv1(obs))

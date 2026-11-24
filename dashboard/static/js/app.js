@@ -25,6 +25,25 @@
 
   const brainView = new Brain.BrainView($("brain-canvas"), $("brain-tooltip"), [], []);
 
+  // Other scripts (lab.js) subscribe to these.
+  const hooks = { init: [], jobs: [], checkpoints: [], tab: [], tick: [] };
+  S.tab = "train";
+
+  function showTab(name) {
+    name = String(name).split("/")[0]; // "#experiments/<id>" opens the Experiments tab
+    if (!document.getElementById(`tab-${name}`)) name = "train";
+    S.tab = name;
+    for (const b of document.querySelectorAll("[data-tab]")) {
+      const on = b.dataset.tab === name;
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
+    for (const p of document.querySelectorAll(".tab-panel")) p.hidden = p.id !== `tab-${name}`;
+    if (location.hash.slice(1).split("/")[0] !== name) history.replaceState(null, "", `#${name}`);
+    for (const c of S.charts) c.dirty = true;
+    for (const fn of hooks.tab) fn(name);
+  }
+
   // ---------- helpers ----------
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -39,7 +58,11 @@
   }
 
   const fmtInt = (n) => Math.round(n).toLocaleString();
-  const fmtSigned = (v, d = 2) => (v === null || v === undefined ? "—" : (v >= 0 ? "+" : "") + v.toFixed(d));
+  const fmtSigned = (v, d = 2) => {
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+    const s = Charts.fixed(v, d);
+    return s.startsWith("-") ? s : `+${s}`;
+  };
   function fmtTime(sec) {
     sec = Math.floor(sec);
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -373,6 +396,7 @@
     const list = $("checkpoints");
     try {
       const items = await (await fetch("/api/checkpoints")).json();
+      for (const fn of hooks.checkpoints) fn(items);
       list.innerHTML = "";
       if (!items.length) list.append(el("li", { class: "meta", text: "No checkpoints yet. Press Save." }));
       for (const item of items) {
@@ -394,9 +418,13 @@
 
   // ---------- message handling ----------
   function handle(msg) {
-    if (msg.init) setup(msg.init);
+    if (msg.init) {
+      setup(msg.init);
+      for (const fn of hooks.init) fn(msg.init);
+    }
     if (!S.init) return;
     setStatus(msg.status);
+    if (msg.jobs) for (const fn of hooks.jobs) fn(msg.jobs);
     if (msg.history) { S.history.push(...msg.history); updateFromHistory(); }
     if (msg.events) addEvents(msg.events);
     if (msg.brain) { S.brain = msg.brain; brainView.setBrain(msg.brain); updateBrainPanels(msg.brain); }
@@ -449,7 +477,8 @@
 
   // Space = start / pause (when not typing in a field)
   document.addEventListener("keydown", (e) => {
-    if (e.code !== "Space" || ["INPUT", "TEXTAREA", "BUTTON", "SELECT"].includes(document.activeElement.tagName)) return;
+    if (S.tab !== "train" || e.code !== "Space" ||
+        ["INPUT", "TEXTAREA", "BUTTON", "SELECT", "SUMMARY"].includes(document.activeElement.tagName)) return;
     e.preventDefault();
     control({ cmd: S.status === "running" ? "pause" : "start" });
   });
@@ -461,13 +490,35 @@
 
   // ---------- animation loop ----------
   function tick(now) {
-    for (const r of Object.values(S.renderers)) r.draw(now);
-    brainView.draw(now);
-    for (const c of S.charts) c.draw();
+    if (S.tab === "train") {
+      for (const r of Object.values(S.renderers)) r.draw(now);
+      brainView.draw(now);
+      for (const c of S.charts) c.draw();
+    }
+    for (const fn of hooks.tick) fn(now, S.tab);
     requestAnimationFrame(tick);
   }
 
+  // Tabs: click, arrow keys, and the address bar (#test, #experiments…)
+  const tabButtons = [...document.querySelectorAll("[data-tab]")];
+  tabButtons.forEach((b, i) => {
+    b.addEventListener("click", () => showTab(b.dataset.tab));
+    b.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const next = tabButtons[(i + (e.key === "ArrowRight" ? 1 : tabButtons.length - 1)) % tabButtons.length];
+      next.focus();
+      showTab(next.dataset.tab);
+    });
+  });
+  $("job-pill").addEventListener("click", () => showTab("experiments"));
+
+  window.App = {
+    $, el, control, toast, fmtSigned, fmtTime, fmtInt, title, hooks, showTab, refreshCheckpoints,
+    getInit: () => S.init,
+  };
+
   setStatus("offline");
   connect();
+  showTab(location.hash.slice(1) || "train");
   requestAnimationFrame(tick);
 })();

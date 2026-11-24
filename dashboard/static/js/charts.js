@@ -25,20 +25,37 @@ const Charts = (() => {
     return String(Math.round(n));
   }
 
+  /** toFixed without "-0.00". */
+  function fixed(v, digits) {
+    const s = v.toFixed(digits);
+    return /^-0\.?0*$/.test(s) ? s.slice(1) : s;
+  }
+
   function fmtNum(v) {
     const a = Math.abs(v);
     if (a !== 0 && (a < 0.01 || a >= 1e4)) return v.toExponential(1);
-    return v.toFixed(a < 1 ? 3 : 2);
+    return fixed(v, a < 1 ? 3 : 2);
+  }
+
+  /** A round step (1, 2 or 5 × 10^n) close to `raw`, so axis labels are readable. */
+  function niceStep(raw) {
+    if (!(raw > 0)) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const n = raw / mag;
+    return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * mag;
   }
 
   class LineChart {
     /**
      * series: [{key, label, color}]   refs: [{value, label, color}]  (dashed lines)
      */
-    constructor(canvas, { series, refs = [], yMin, yMax, format = fmtNum }) {
+    constructor(canvas, { series, refs = [], markers = [], yMin, yMax, format = fmtNum, xKey = "step", emptyText }) {
       this.canvas = canvas;
-      this.series = series;
+      this.series = series;   // [{key, label, color, lo?, hi?}]  lo/hi = keys of a shaded band
       this.refs = refs;
+      this.markers = markers; // [{x, label}] vertical dashed lines
+      this.xKey = xKey;
+      this.emptyText = emptyText || "Waiting for the first update…";
       this.yMin = yMin;
       this.yMax = yMax;
       this.format = format;
@@ -49,7 +66,7 @@ const Charts = (() => {
         this.hoverX = e.clientX - canvas.getBoundingClientRect().left;
         this.dirty = true;
       });
-      canvas.addEventListener("mouseleave", () => { this.hoverX = null; this.dirty = true; });
+      canvas.addEventListener("mouseleave", () => { this.hoverX = null; this.dirty = true; hideTip(); });
     }
 
     setRows(rows) { this.rows = rows; this.dirty = true; }
@@ -64,10 +81,13 @@ const Charts = (() => {
       const rows = this.rows;
 
       // y range from data + reference lines
+      const xk = this.xKey;
       let lo = Infinity, hi = -Infinity;
       for (const r of rows) for (const s of this.series) {
-        const v = r[s.key];
-        if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+        for (const key of [s.key, s.lo, s.hi]) {
+          const v = key ? r[key] : undefined;
+          if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+        }
       }
       for (const ref of this.refs) if (Number.isFinite(ref.value)) { lo = Math.min(lo, ref.value); hi = Math.max(hi, ref.value); }
       if (this.yMin !== undefined) lo = this.yMin;
@@ -80,8 +100,8 @@ const Charts = (() => {
         if (this.yMax === undefined) hi += span * 0.06;
       }
 
-      const xMin = rows.length ? rows[0].step : 0;
-      const xMax = rows.length > 1 ? rows[rows.length - 1].step : xMin + 1;
+      const xMin = rows.length ? rows[0][xk] : 0;
+      const xMax = rows.length > 1 ? rows[rows.length - 1][xk] : xMin + 1;
       const X = (s) => x0 + ((s - xMin) / (xMax - xMin || 1)) * (x1 - x0);
       const Y = (v) => y1 - ((v - lo) / (hi - lo)) * (y1 - y0);
 
@@ -90,19 +110,19 @@ const Charts = (() => {
       ctx.lineWidth = 1;
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
-      for (let i = 0; i <= 4; i++) {
-        const v = lo + ((hi - lo) * i) / 4;
+      const yStep = niceStep((hi - lo) / 4);
+      for (let v = Math.ceil(lo / yStep - 1e-9) * yStep; v <= hi + yStep * 1e-6; v += yStep) {
         const y = Math.round(Y(v)) + 0.5;
         ctx.strokeStyle = "rgba(148,163,196,0.10)";
         ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
         ctx.fillStyle = "#7f8bab";
-        ctx.fillText(this.format(v), x0 - 6, y);
+        ctx.fillText(this.format(Math.abs(v) < yStep * 1e-6 ? 0 : v), x0 - 6, y);
       }
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       if (rows.length) {
-        for (let i = 0; i <= 4; i++) {
-          const s = xMin + ((xMax - xMin) * i) / 4;
+        const xStep = niceStep((xMax - xMin) / 4);
+        for (let s = Math.ceil(xMin / xStep - 1e-9) * xStep; s <= xMax + xStep * 1e-6; s += xStep) {
           ctx.fillText(fmtSteps(s), X(s), y1 + 6);
         }
       }
@@ -122,18 +142,53 @@ const Charts = (() => {
       if (!rows.length) {
         ctx.fillStyle = "#6b7796";
         ctx.textBaseline = "middle";
-        ctx.fillText("Waiting for the first update…", (x0 + x1) / 2, (y0 + y1) / 2);
+        ctx.fillText(this.emptyText, (x0 + x1) / 2, (y0 + y1) / 2);
         return;
       }
 
+      // vertical markers (e.g. "game switch")
+      for (const m of this.markers) {
+        if (!Number.isFinite(m.x) || m.x < xMin || m.x > xMax) continue;
+        const x = X(m.x);
+        ctx.save();
+        ctx.setLineDash([3, 4]);
+        ctx.strokeStyle = "rgba(230,236,255,0.45)";
+        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+        ctx.restore();
+        // label in a small pill, on whichever side of the line has room
+        ctx.font = FONT;
+        const lw = ctx.measureText(m.label).width + 10;
+        const lx = x + 4 + lw > x1 ? x - 4 - lw : x + 4;
+        ctx.fillStyle = "rgba(10,14,28,0.85)";
+        ctx.beginPath(); ctx.roundRect(lx, y0 + 1, lw, 16, 6); ctx.fill();
+        ctx.fillStyle = "#c7d2fe";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(m.label, lx + 5, y0 + 9);
+      }
+
+      // shaded bands (e.g. confidence intervals across seeds)
+      for (const s of this.series) {
+        if (!s.lo || !s.hi) continue;
+        const pts = rows.filter((r) => Number.isFinite(r[s.lo]) && Number.isFinite(r[s.hi]));
+        if (pts.length < 2) continue;
+        ctx.beginPath();
+        pts.forEach((r, i) => (i ? ctx.lineTo(X(r[xk]), Y(r[s.hi])) : ctx.moveTo(X(r[xk]), Y(r[s.hi]))));
+        for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(X(pts[i][xk]), Y(pts[i][s.lo]));
+        ctx.closePath();
+        ctx.fillStyle = s.color + "2e";
+        ctx.fill();
+      }
+
       // series lines with a soft glow and area fill
+      const hasBands = this.series.some((s) => s.lo);
       for (const s of this.series) {
         ctx.beginPath();
         let started = false, firstX = 0, lastX = 0;
         for (const r of rows) {
           const v = r[s.key];
           if (!Number.isFinite(v)) { continue; }
-          const x = X(r.step), y = Y(v);
+          const x = X(r[xk]), y = Y(v);
           if (!started) { ctx.moveTo(x, y); started = true; firstX = x; } else ctx.lineTo(x, y);
           lastX = x;
         }
@@ -145,7 +200,7 @@ const Charts = (() => {
         ctx.shadowBlur = 8;
         ctx.stroke();
         ctx.restore();
-        if (this.series.length <= 2) {
+        if (this.series.length <= 2 && !hasBands) {
           ctx.lineTo(lastX, y1); ctx.lineTo(firstX, y1); ctx.closePath();
           const grad = ctx.createLinearGradient(0, y0, 0, y1);
           grad.addColorStop(0, s.color + "33");
@@ -155,39 +210,54 @@ const Charts = (() => {
         }
       }
 
-      // hover crosshair + tooltip
+      // hover: crosshair and dots on the canvas, details in a floating HTML tooltip
       if (this.hoverX !== null && this.hoverX >= x0 && this.hoverX <= x1) {
         const target = xMin + ((this.hoverX - x0) / (x1 - x0)) * (xMax - xMin);
         let best = rows[0];
-        for (const r of rows) if (Math.abs(r.step - target) < Math.abs(best.step - target)) best = r;
-        const x = X(best.step);
+        for (const r of rows) if (Math.abs(r[xk] - target) < Math.abs(best[xk] - target)) best = r;
+        const x = X(best[xk]);
         ctx.strokeStyle = "rgba(230,236,255,0.35)";
         ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
-        const lines = [`update ${best.update} · ${fmtSteps(best.step)} moves`];
+        const head = best.update !== undefined ? `update ${best.update} · ${fmtSteps(best[xk])} moves` : `${fmtSteps(best[xk])} moves`;
+        const items = [];
         for (const s of this.series) {
           const v = best[s.key];
-          if (Number.isFinite(v)) {
-            ctx.fillStyle = s.color;
-            ctx.beginPath(); ctx.arc(x, Y(v), 3.5, 0, Math.PI * 2); ctx.fill();
-            lines.push(`${s.label}: ${this.format(v)}`);
-          }
+          if (!Number.isFinite(v)) continue;
+          ctx.fillStyle = s.color;
+          ctx.beginPath(); ctx.arc(x, Y(v), 3.5, 0, Math.PI * 2); ctx.fill();
+          const lo = best[s.lo], hi = best[s.hi];
+          const band = s.lo && Number.isFinite(lo) && Math.abs(hi - lo) > 1e-9 ? ` <span class="tip-ci">[${this.format(lo)}, ${this.format(hi)}]</span>` : "";
+          items.push(`<div><i style="background:${s.color}"></i>${s.label}: <b>${this.format(v)}</b>${band}</div>`);
         }
-        ctx.font = FONT;
-        const tw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 16;
-        const th = lines.length * 15 + 8;
-        const tx = x + tw + 12 > x1 ? x - tw - 10 : x + 10;
-        ctx.fillStyle = "rgba(10,14,28,0.92)";
-        ctx.strokeStyle = "rgba(124,92,255,0.6)";
-        ctx.beginPath(); ctx.roundRect(tx, y0 + 4, tw, th, 8); ctx.fill(); ctx.stroke();
-        ctx.textAlign = "left";
-        ctx.textBaseline = "top";
-        lines.forEach((l, i) => {
-          ctx.fillStyle = i === 0 ? "#94a3c4" : "#e6ecff";
-          ctx.fillText(l, tx + 8, y0 + 9 + i * 15);
-        });
+        const rect = this.canvas.getBoundingClientRect();
+        showTip(`<div class="tip-head">${head}</div>${items.join("")}`, rect.left + x, rect.top + y0);
+      } else if (this._tipOwner) {
+        hideTip();
       }
+      this._tipOwner = this.hoverX !== null;
     }
   }
+
+  // one shared tooltip element, kept inside the window
+  let tipEl = null;
+  function showTip(html, clientX, clientY) {
+    if (!tipEl) {
+      tipEl = document.createElement("div");
+      tipEl.className = "chart-tip";
+      tipEl.setAttribute("role", "tooltip");
+      document.body.append(tipEl);
+    }
+    tipEl.innerHTML = html;
+    tipEl.hidden = false;
+    const { width, height } = tipEl.getBoundingClientRect();
+    let left = clientX + 14;
+    if (left + width > window.innerWidth - 8) left = clientX - width - 14;
+    left = Math.max(8, left);
+    const top = Math.min(Math.max(8, clientY), window.innerHeight - height - 8);
+    tipEl.style.left = `${left}px`;
+    tipEl.style.top = `${top}px`;
+  }
+  function hideTip() { if (tipEl) tipEl.hidden = true; }
 
   /** Histogram of weights for one layer, drawn inside a box. */
   function histogram(ctx, x, y, w, h, hist, color, label) {
@@ -215,5 +285,40 @@ const Charts = (() => {
     ctx.beginPath(); ctx.moveTo(x + w / 2, top); ctx.lineTo(x + w / 2, top + height); ctx.stroke();
   }
 
-  return { setup, fmtSteps, fmtNum, LineChart, histogram };
+  /** Grouped bar chart of histogram counts. series: [{counts, color, label}] */
+  function bars(canvas, { range, series }) {
+    const { ctx, w, h } = setup(canvas);
+    ctx.clearRect(0, 0, w, h);
+    if (!series.length) return;
+    const pad = { l: 34, r: 8, t: 8, b: 20 };
+    const x0 = pad.l, x1 = w - pad.r, y0 = pad.t, y1 = h - pad.b;
+    const bins = series[0].counts.length;
+    const max = Math.max(1, ...series.flatMap((s) => s.counts));
+    const bw = (x1 - x0) / bins;
+    ctx.font = FONT;
+    ctx.fillStyle = "#7f8bab";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 2; i++) {
+      const v = (max * i) / 2, y = y1 - ((y1 - y0) * i) / 2;
+      ctx.fillText(String(Math.round(v)), x0 - 5, y);
+      ctx.strokeStyle = "rgba(148,163,196,0.10)";
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    }
+    series.forEach((s, k) => {
+      const sw = (bw - 2) / series.length;
+      s.counts.forEach((c, i) => {
+        const bh = ((y1 - y0) * c) / max;
+        ctx.fillStyle = s.color;
+        ctx.fillRect(x0 + i * bw + 1 + k * sw, y1 - bh, Math.max(1, sw - 1), bh);
+      });
+    });
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#7f8bab";
+    const [lo, hi] = range;
+    for (const v of [lo, (lo + hi) / 2, hi]) ctx.fillText(v.toFixed(1), x0 + ((v - lo) / (hi - lo)) * (x1 - x0), y1 + 5);
+  }
+
+  return { setup, fmtSteps, fmtNum, fixed, niceStep, LineChart, histogram, bars };
 })();
