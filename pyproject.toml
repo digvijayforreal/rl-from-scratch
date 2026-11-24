@@ -1,0 +1,22 @@
+[project]
+name = "rl-from-scratch"
+version = "0.1.0"
+description = "Reinforcement learning from scratch: plasticity loss under controlled game changes"
+authors = [
+    { name = "Digvijay", email = "digvijayforreal@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.5",
+    "torch>=2.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

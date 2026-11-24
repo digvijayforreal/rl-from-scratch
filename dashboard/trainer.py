@@ -1,0 +1,497 @@
+"""Background PPO trainer and live 'showcase' player for the dashboard.
+
+Trainer  : runs the same PPO loop as experiments/train.py in a thread, and
+           records everything the dashboard shows (scores, losses, brain stats).
+Showcase : plays one copy of every game at human speed with the latest
+           weights, so you can watch the agent improve while it trains.
+"""
+
+import math
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from agents.network import LAYER_NAMES, SmallMultiGameNet, count_parameters
+from agents.ppo import RolloutCollector, compute_gae, ppo_update, to_tensor
+from envs.base import ACTION_NAMES, AGENT, CHANNEL_NAMES, GOAL, GRID, ITEM, NUM_ACTIONS
+from experiments.train import CONFIG, GAMES, make_envs
+
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+# Settings the dashboard may change, with (type, min, max).
+CONFIG_LIMITS = {
+    "lr": (float, 1e-5, 1e-2),
+    "ent_coef": (float, 0.0, 0.2),
+    "clip": (float, 0.05, 0.5),
+    "gamma": (float, 0.8, 0.999),
+    "lam": (float, 0.5, 1.0),
+    "total_steps": (int, 10_000, 5_000_000),
+    "envs_per_game": (int, 1, 8),
+    "rollout_steps": (int, 16, 512),
+    "epochs": (int, 1, 10),
+    "minibatches": (int, 1, 16),
+    "seed": (int, 0, 10_000),
+}
+
+SUCCESS_EVENTS = {"catch", "goal"}
+
+
+class StopTraining(Exception):
+    pass
+
+
+def clean(x):
+    """Make a value JSON-safe (no NaN or infinity)."""
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+    if isinstance(x, dict):
+        return {k: clean(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [clean(v) for v in x]
+    return x
+
+
+def rounded(t, digits=3):
+    return np.round(t.detach().cpu().numpy().astype(np.float64), digits).ravel().tolist()
+
+
+def sanitize_config(updates, base):
+    cfg = dict(base)
+    for key, value in (updates or {}).items():
+        if key not in CONFIG_LIMITS:
+            continue
+        typ, lo, hi = CONFIG_LIMITS[key]
+        try:
+            value = typ(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        cfg[key] = min(max(value, lo), hi)
+    return cfg
+
+
+def random_baseline(name, episodes=400, seed=4242):
+    """Average return of random valid moves (the 'zero skill' line on the chart)."""
+    env = GAMES[name](seed=seed)
+    rng = np.random.default_rng(seed)
+    total = 0.0
+    for _ in range(episodes):
+        env.reset()
+        done = False
+        while not done:
+            _, r, term, trunc = env.step(int(rng.choice(env.valid_actions)))
+            total += r
+            done = term or trunc
+    return total / episodes
+
+
+def optimal_score(name):
+    """Best possible average return, worked out exactly."""
+    if name == "catch":
+        return 1.0  # the paddle can always reach the ball in time
+    if name == "reach":
+        # Shortest path = Manhattan distance d; return = 1 - 0.01 * (d - 1). Average over all start/goal pairs.
+        cells = [(r, c) for r in range(GRID) for c in range(GRID)]
+        scores = [1 - 0.01 * (abs(a[0] - b[0]) + abs(a[1] - b[1]) - 1)
+                  for a in cells for b in cells if a != b]
+        return float(np.mean(scores))
+    return None
+
+
+class Trainer:
+    def __init__(self):
+        self.lock = threading.Lock()        # held while the training thread uses the network
+        self.resume_event = threading.Event()
+        self.resume_event.set()
+        self.thread = None
+        self.stop_flag = False
+        self.delay_ms = 0                   # slow-motion: pause this long after every move
+        self.version = 0                    # increases whenever the weights change
+        self.run_id = 0
+        self.events = []                    # (id, kind, text) log shown on the dashboard
+        self.games = list(CONFIG["games"])
+        self.baselines = {g: {"random": random_baseline(g), "optimal": optimal_score(g)}
+                          for g in self.games}
+        self.build(dict(CONFIG))
+
+    # ---------- setup ----------
+
+    def build(self, cfg):
+        torch.manual_seed(cfg["seed"])
+        np.random.seed(cfg["seed"])
+        self.cfg = cfg
+        self.envs = make_envs(cfg)
+        self.net = SmallMultiGameNet()
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=cfg["lr"])
+        self.collector = RolloutCollector(self.envs, cfg["gamma"])
+        self.batch_size = len(self.envs) * cfg["rollout_steps"]
+        self.num_updates = max(1, cfg["total_steps"] // self.batch_size)
+        self.num_params = count_parameters(self.net)
+
+        self.run_id += 1
+        self.status = "idle"
+        self.phase = "idle"
+        self.phase_progress = 0.0
+        self.update = 0
+        self.env_steps = 0
+        self.active_time = 0.0
+        self.update_started = None
+        self.sps = 0.0
+        self.lr = cfg["lr"]
+        self.history = []
+        self.milestones = set()
+        self._grad_sums = {}
+        self._mb_count = 0
+        self.arena = [self._arena_entry(env, None, None) for env in self.envs]
+        self._publish(grad_norm=None, weight_change=None)
+        self.log("info", f"New network built: {self.num_params:,} parameters, "
+                         f"{len(self.envs)} games in parallel, {self.num_updates} updates planned.")
+
+    def log(self, kind, text):
+        self.events.append({"id": len(self.events), "kind": kind, "text": text,
+                            "time": time.strftime("%H:%M:%S")})
+
+    # ---------- controls ----------
+
+    def start(self):
+        if self.status == "paused":
+            return self.resume()
+        if self.status != "idle":
+            return
+        self.stop_flag = False
+        self.resume_event.set()
+        self.status = "running"
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.log("info", "Training started.")
+
+    def pause(self):
+        if self.status == "running":
+            self.resume_event.clear()
+            self.status = "paused"
+            self.log("info", f"Paused at update {self.update}.")
+
+    def resume(self):
+        if self.status == "paused":
+            self.status = "running"
+            self.resume_event.set()
+            self.log("info", "Resumed.")
+
+    def reset(self, updates=None):
+        self.stop_flag = True
+        self.resume_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=30)
+        self.thread = None
+        self.build(sanitize_config(updates, self.cfg))
+
+    def save(self):
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = RESULTS_DIR / f"dashboard_u{self.update:04d}_{time.strftime('%Y%m%d-%H%M%S')}.pt"
+        with self.lock:
+            torch.save({"model": self.net.state_dict(), "config": self.cfg,
+                        "update": self.update, "env_steps": self.env_steps}, path)
+        self.log("success", f"Saved checkpoint {path.name}")
+        return path.name
+
+    def list_checkpoints(self):
+        if not RESULTS_DIR.exists():
+            return []
+        files = sorted(RESULTS_DIR.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return [{"name": p.name, "size_kb": round(p.stat().st_size / 1024, 1),
+                 "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime))}
+                for p in files]
+
+    def load(self, name):
+        """Load weights from results/ into the current network (training must not be running)."""
+        if self.status == "running":
+            raise ValueError("Pause training before loading a checkpoint.")
+        safe_name = Path(str(name)).name  # no folders, so nothing outside results/ can be read
+        path = RESULTS_DIR / safe_name
+        if path.suffix != ".pt" or not path.is_file():
+            raise ValueError(f"Checkpoint {safe_name} not found.")
+        saved = torch.load(path, weights_only=True)
+        with self.lock:
+            self.net.load_state_dict(saved["model"])
+            self._publish(grad_norm=None, weight_change=None)
+        self.log("success", f"Loaded {safe_name}. The live players now use these weights.")
+
+    # ---------- training loop ----------
+
+    def _run(self):
+        cfg = self.cfg
+        try:
+            while self.update < self.num_updates and not self.stop_flag:
+                u = self.update + 1
+                self.lr = cfg["lr"] * (1 - (u - 1) / self.num_updates)
+                for group in self.optimizer.param_groups:
+                    group["lr"] = self.lr
+                self.update_started = time.time()
+
+                with self.lock:
+                    self.phase, self.phase_progress = "collect", 0.0
+                    batch, last_value = self.collector.collect(self.net, cfg["rollout_steps"],
+                                                               on_step=self._on_step)
+                    self.phase, self.phase_progress = "advantage", 0.0
+                    advantages, returns = compute_gae(batch["reward"], batch["value"], batch["done"],
+                                                      last_value, cfg["gamma"], cfg["lam"])
+                    self.phase_progress = 1.0
+                    self.phase, self.phase_progress = "update", 0.0
+                    before = {n: getattr(self.net, n).weight.detach().clone() for n in LAYER_NAMES}
+                    self._grad_sums = {n: 0.0 for n in LAYER_NAMES}
+                    self._mb_count = 0
+                    stats = ppo_update(self.net, self.optimizer, batch, advantages, returns, cfg,
+                                       on_minibatch=self._on_minibatch)
+                    grad_norm = {n: self._grad_sums[n] / max(1, self._mb_count) for n in LAYER_NAMES}
+                    change = {}
+                    for n in LAYER_NAMES:
+                        w = getattr(self.net, n).weight.detach()
+                        change[n] = float((w - before[n]).norm() / (before[n].norm() + 1e-12))
+                    plasticity = self._plasticity(batch["obs"])
+                    self._publish(grad_norm=grad_norm, weight_change=change)
+
+                duration = time.time() - self.update_started
+                self.active_time += duration
+                self.update_started = None
+                self.sps = self.batch_size / max(duration, 1e-6)
+                self.update = u
+                self._record(stats, plasticity)
+
+            if not self.stop_flag:
+                self.status, self.phase = "finished", "idle"
+                self.log("success", "Training finished.")
+                self.save()
+        except StopTraining:
+            pass
+        except Exception as exc:  # show the error on the dashboard instead of dying silently
+            self.status, self.phase = "error", "idle"
+            self.log("warn", f"Training crashed: {exc!r}")
+            raise
+
+    def _on_step(self, t, actions, probs):
+        self.env_steps += len(self.envs)
+        self.phase_progress = (t + 1) / self.cfg["rollout_steps"]
+        self.arena = [self._arena_entry(env, int(actions[i]), probs[i])
+                      for i, env in enumerate(self.envs)]
+        if self.stop_flag:
+            raise StopTraining
+        if self.delay_ms > 0 or not self.resume_event.is_set():
+            # Let go of the network while waiting, so a checkpoint can be loaded during a pause.
+            self.lock.release()
+            try:
+                if self.delay_ms > 0:
+                    time.sleep(self.delay_ms / 1000)
+                self.resume_event.wait()
+            finally:
+                self.lock.acquire()
+            if self.stop_flag:
+                raise StopTraining
+
+    def _on_minibatch(self, epoch):
+        for n in LAYER_NAMES:
+            grad = getattr(self.net, n).weight.grad
+            self._grad_sums[n] += float(grad.norm()) if grad is not None else 0.0
+        self._mb_count += 1
+        self.phase_progress = self._mb_count / (self.cfg["epochs"] * self.cfg["minibatches"])
+
+    def _arena_entry(self, env, action, probs):
+        return {"game": env.name, "state": env.state(), "action": action,
+                "prob": None if probs is None or action is None else round(float(probs[action]), 3)}
+
+    # ---------- brain statistics ----------
+
+    def _plasticity(self, obs_batch):
+        """Dormant neurons (Sokar et al., 2023) and effective feature rank (Kumar et al., 2021)."""
+        obs = obs_batch.reshape(-1, *obs_batch.shape[2:])
+        obs = obs[torch.randperm(obs.shape[0])[:512]]
+        mask = torch.ones(obs.shape[0], NUM_ACTIONS, dtype=torch.bool)
+        with torch.no_grad():
+            _, _, acts = self.net(obs, mask, return_activations=True)
+        out = {}
+        for name, a in acts.items():
+            score = a.abs().mean(dim=(0, 2, 3)) if a.dim() == 4 else a.abs().mean(dim=0)
+            normalized = score / (score.mean() + 1e-8)
+            out[f"dormant_{name}"] = float((normalized <= 0.025).float().mean())
+        s = torch.linalg.svdvals(acts["fc"])
+        if float(s.sum()) > 0:
+            cumulative = torch.cumsum(s, 0) / s.sum()
+            out["eff_rank"] = int((cumulative < 0.99).sum()) + 1
+        else:
+            out["eff_rank"] = 0
+        return out
+
+    def _publish(self, grad_norm, weight_change):
+        """Share a copy of the weights with the live players, plus brain stats for the dashboard."""
+        net = self.net
+        histograms = {}
+        for n in LAYER_NAMES:
+            w = getattr(net, n).weight.detach().cpu().numpy().ravel()
+            lim = float(np.abs(w).max()) or 1.0
+            counts, _ = np.histogram(w, bins=31, range=(-lim, lim))
+            histograms[n] = {"lim": lim, "counts": counts.tolist(),
+                             "norm": float(np.linalg.norm(w)), "count": int(w.size)}
+        conv1 = net.conv1.weight.detach()[:, [AGENT, GOAL, ITEM]]  # 16 filters x 3 channels x 3 x 3
+        self.version += 1
+        self.brain = clean({
+            "version": self.version,
+            "update": self.update,
+            "policy_w": rounded(net.policy.weight),  # 6 x 128
+            "value_w": rounded(net.value.weight),    # 128
+            "conv1": rounded(conv1),
+            "conv1_channels": ["agent", "goal", "item"],
+            "hist": histograms,
+            "grad_norm": grad_norm,
+            "weight_change": weight_change,
+        })
+        self.weights = (self.version, {k: v.detach().clone() for k, v in net.state_dict().items()})
+
+    def _record(self, stats, plasticity):
+        row = {"update": self.update, "step": self.env_steps, "lr": self.lr,
+               "time": round(self.active_time, 2), "sps": self.sps, **stats, **plasticity}
+        for g in self.games:
+            recent = [r for name, r in self.collector.finished if name == g][-100:]
+            row[f"score_{g}"] = float(np.mean(recent)) if recent else None
+        self.history.append(clean(row))
+        self._check_milestones(row)
+
+    def _check_milestones(self, row):
+        for g in self.games:
+            score = row.get(f"score_{g}")
+            base = self.baselines[g]
+            if score is None or base["optimal"] is None:
+                continue
+            progress = (score - base["random"]) / (base["optimal"] - base["random"])
+            for level in (0.5, 0.9):
+                key = (g, level)
+                if progress >= level and key not in self.milestones:
+                    self.milestones.add(key)
+                    self.log("success", f"{g.title()} reached {int(level * 100)}% of the way from "
+                                        f"random to perfect at {self.env_steps:,} steps "
+                                        f"(score {score:+.2f}).")
+        if row["entropy"] < 0.05 and "low_entropy" not in self.milestones:
+            self.milestones.add("low_entropy")
+            self.log("warn", "Entropy is very low: the agent has almost stopped exploring.")
+        if row["approx_kl"] > 0.05 and row["update"] - getattr(self, "_last_kl_warn", -99) >= 20:
+            self._last_kl_warn = row["update"]  # warn at most once every 20 updates
+            self.log("warn", f"Update {row['update']}: large policy jump (KL {row['approx_kl']:.3f}).")
+        if row["update"] % 10 == 0:
+            scores = " · ".join(f"{g} {row[f'score_{g}']:+.2f}" for g in self.games
+                                if row.get(f"score_{g}") is not None)
+            self.log("info", f"Update {row['update']}/{self.num_updates} · {scores}")
+
+    def elapsed(self):
+        partial = time.time() - self.update_started if self.update_started else 0.0
+        return self.active_time + (partial if self.status == "running" else 0.0)
+
+
+class Showcase:
+    """Plays every game at watchable speed using the newest weights."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.fps = 6
+        self.mode = "greedy"  # "greedy" = always the best move, "sample" = like during training
+        self.net = SmallMultiGameNet()
+        self.net.eval()
+        self.version = -1
+        self.generator = torch.Generator().manual_seed(0)
+        self.envs = {g: GAMES[g](seed=7000 + i) for i, g in enumerate(trainer.games)}
+        self.obs = {g: env.reset() for g, env in self.envs.items()}
+        self.ep_return = {g: 0.0 for g in self.envs}
+        self.episode = {g: 1 for g in self.envs}
+        self.needs_reset = {g: False for g in self.envs}
+        self.results = {g: deque(maxlen=50) for g in self.envs}
+        self.frames = {}
+        self.seq = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _sync(self):
+        version, weights = self.trainer.weights
+        if version != self.version:
+            self.net.load_state_dict(weights)
+            self.version = version
+
+    def _run(self):
+        while True:
+            started = time.time()
+            try:
+                self._sync()
+                for g, env in self.envs.items():
+                    self._tick(g, env)
+            except Exception as exc:
+                self.trainer.log("warn", f"Live player error: {exc!r}")
+                time.sleep(1)
+            time.sleep(max(0.0, 1 / self.fps - (time.time() - started)))
+
+    def _tick(self, g, env):
+        self.seq += 1
+        if self.needs_reset[g]:
+            self.obs[g] = env.reset()
+            self.ep_return[g] = 0.0
+            self.episode[g] += 1
+            self.needs_reset[g] = False
+            state = env.state()
+            self.frames[g] = self._frame(g, env, state, state, None, None, None, 0.0,
+                                         reset=True)
+            return
+
+        obs = self.obs[g]
+        mask = to_tensor(env.action_mask()[None], torch.bool)
+        with torch.no_grad():
+            logits, value, acts = self.net(to_tensor(obs[None]), mask, return_activations=True)
+        probs = torch.softmax(logits, -1)[0]
+        if self.mode == "greedy":
+            action = int(probs.argmax())
+        else:
+            action = int(torch.multinomial(probs, 1, generator=self.generator))
+
+        before = env.state()
+        self.obs[g], reward, terminated, truncated = env.step(action)
+        self.ep_return[g] += reward
+        if terminated or truncated:
+            self.needs_reset[g] = True
+            self.results[g].append((self.ep_return[g], env.last_event in SUCCESS_EVENTS))
+        self.frames[g] = self._frame(g, env, before, env.state(), action, probs, value, reward,
+                                     acts=acts, obs=obs, done=terminated or truncated)
+
+    def _frame(self, g, env, before, after, action, probs, value, reward,
+               acts=None, obs=None, done=False, reset=False):
+        results = self.results[g]
+        frame = {
+            "seq": self.seq, "game": g, "episode": self.episode[g], "step": env.steps,
+            "prev": before, "state": after, "reset": reset, "done": done,
+            "event": None if reset else env.last_event,
+            "action": action, "action_name": None if action is None else ACTION_NAMES[action],
+            "valid": env.valid_actions,
+            "probs": None if probs is None else rounded(probs, 4),
+            "value": None if value is None else float(value[0]),
+            "reward": reward, "ep_return": round(self.ep_return[g], 3),
+            "recent_return": float(np.mean([r for r, _ in results])) if results else None,
+            "success_rate": float(np.mean([s for _, s in results])) if results else None,
+            "weights_version": self.version,
+        }
+        if acts is not None:
+            frame["obs"] = obs.astype(np.int8).ravel().tolist()
+            frame["acts"] = {name: rounded(a, 3) for name, a in acts.items()}
+        return clean(frame)
+
+
+def init_payload(trainer):
+    return clean({
+        "config": trainer.cfg,
+        "limits": {k: [lo, hi] for k, (_, lo, hi) in CONFIG_LIMITS.items()},
+        "games": trainer.games,
+        "num_envs": len(trainer.envs),
+        "num_updates": trainer.num_updates,
+        "params": trainer.num_params,
+        "baselines": trainer.baselines,
+        "actions": ACTION_NAMES,
+        "channels": CHANNEL_NAMES,
+        "layers": LAYER_NAMES,
+        "grid": GRID,
+    })

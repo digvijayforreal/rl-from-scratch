@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RL Playground · Multi-Game PPO</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="explain-on">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"></div>
+      <div>
+        <h1>RL Playground</h1>
+        <p>One PPO network learning every game, live</p>
+      </div>
+    </div>
+    <div id="status-pill" class="status-pill" role="status" aria-live="polite">Connecting…</div>
+    <nav class="controls" aria-label="Training controls">
+      <button id="btn-start" class="btn primary" type="button">▶ Start</button>
+      <button id="btn-pause" class="btn" type="button">❚❚ Pause</button>
+      <button id="btn-reset" class="btn" type="button" title="Throw away this network and build a fresh one">↺ Reset</button>
+      <button id="btn-save" class="btn" type="button">⤓ Save</button>
+      <button id="btn-explain" class="btn ghost" type="button" aria-pressed="true">? Explain</button>
+    </nav>
+  </header>
+
+  <main id="main">
+    <!-- Key numbers -->
+    <section class="kpis" aria-label="Key numbers">
+      <div class="kpi"><span class="kpi-label">Update</span><span class="kpi-value" id="kpi-update">0</span><span class="kpi-sub" id="kpi-update-sub">of 0</span></div>
+      <div class="kpi"><span class="kpi-label">Moves played</span><span class="kpi-value" id="kpi-steps">0</span><span class="kpi-sub" id="kpi-sps">0 moves/s</span></div>
+      <div class="kpi"><span class="kpi-label">Training time</span><span class="kpi-value" id="kpi-time">0:00</span><span class="kpi-sub" id="kpi-lr">lr —</span></div>
+      <div class="kpi"><span class="kpi-label">Parameters</span><span class="kpi-value" id="kpi-params">—</span><span class="kpi-sub">numbers training can change</span></div>
+      <div id="kpi-games" class="kpi-games"></div>
+      <div class="kpi"><span class="kpi-label">Exploration</span><span class="kpi-value" id="kpi-entropy">—</span><span class="kpi-sub">policy entropy</span></div>
+      <div class="kpi"><span class="kpi-label">Dormant neurons</span><span class="kpi-value" id="kpi-dormant">—</span><span class="kpi-sub">hidden layer, a plasticity signal</span></div>
+    </section>
+    <div class="progress-track" aria-hidden="true"><div id="overall-progress" class="progress-fill"></div></div>
+
+    <!-- Live play + PPO loop -->
+    <section class="row play-row">
+      <div class="panel" id="panel-play">
+        <div class="panel-head">
+          <h2>Live play <span class="tag">current brain</span></h2>
+          <div class="inline-controls">
+            <label>Speed <input id="demo-fps" type="range" min="1" max="30" step="1" value="6" aria-describedby="demo-fps-val"> <output id="demo-fps-val">6 fps</output></label>
+            <div class="seg" role="group" aria-label="How the live player chooses moves">
+              <button type="button" data-mode="greedy" class="on">Best move</button>
+              <button type="button" data-mode="sample">Sample</button>
+            </div>
+          </div>
+        </div>
+        <p class="explain">A separate copy of every game, played with the <b>newest weights</b> after each update, slowed down so you can watch. "Best move" always picks the highest-probability action; "Sample" rolls the dice the way training does. Arrows show how likely each move is.</p>
+        <div id="games" class="games"></div>
+      </div>
+
+      <div class="panel" id="panel-loop">
+        <div class="panel-head"><h2>The PPO loop</h2><span class="tag" id="loop-update">update 0</span></div>
+        <p class="explain">Every update repeats these four steps. The highlighted step is what the trainer is doing right now.</p>
+        <ol class="loop">
+          <li class="stage" data-phase="collect">
+            <div class="stage-num">1</div>
+            <div class="stage-body">
+              <h3>Collect experience</h3>
+              <p id="stage-collect-text">Play all games in parallel and record every move.</p>
+              <div class="bar"><div class="bar-fill" id="bar-collect"></div></div>
+              <p class="explain">The network picks moves by sampling from its probabilities, so it keeps exploring. Each step stores the board, the move, its probability, the reward and the value guess.</p>
+            </div>
+          </li>
+          <li class="stage" data-phase="advantage">
+            <div class="stage-num">2</div>
+            <div class="stage-body">
+              <h3>Score every move (GAE)</h3>
+              <p id="stage-adv-text">Advantage = how much better a move turned out than expected.</p>
+              <div class="formula">A<sub>t</sub> = δ<sub>t</sub> + γλ·A<sub>t+1</sub>, &nbsp; δ<sub>t</sub> = r<sub>t</sub> + γ·V(s<sub>t+1</sub>) − V(s<sub>t</sub>)</div>
+              <p class="explain">Walks backwards through the rollout. Positive advantage: the move led to more reward than the value head predicted, so make it more likely.</p>
+            </div>
+          </li>
+          <li class="stage" data-phase="update">
+            <div class="stage-num">3</div>
+            <div class="stage-body">
+              <h3>Update the brain</h3>
+              <p id="stage-update-text">Several passes of gradient descent on the clipped loss.</p>
+              <div class="bar"><div class="bar-fill" id="bar-update"></div></div>
+              <div class="formula">L = −min(ρ·A, clip(ρ, 1±ε)·A) + c<sub>v</sub>·(V−R)² − c<sub>e</sub>·H</div>
+              <p class="explain">ρ is how much more likely the move is now than when it was played. Clipping at 1±ε stops one update from changing the policy too much. The value term teaches the critic; the entropy term H keeps exploring.</p>
+            </div>
+          </li>
+          <li class="stage" data-phase="repeat">
+            <div class="stage-num">4</div>
+            <div class="stage-body">
+              <h3>Share and repeat</h3>
+              <p>The live players get the new weights, the learning rate shrinks a little, and the loop starts again.</p>
+            </div>
+          </li>
+        </ol>
+        <div class="speed-box">
+          <label for="train-delay">Training slow-motion</label>
+          <input id="train-delay" type="range" min="0" max="200" step="5" value="0" aria-describedby="train-delay-val">
+          <output id="train-delay-val">max speed</output>
+          <p class="explain">Adds a pause after every move during collection, so you can follow the training games below. Full speed is much faster.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Brain -->
+    <section class="panel" id="panel-brain">
+      <div class="panel-head">
+        <h2>The brain, thinking live</h2>
+        <div class="inline-controls">
+          <span class="muted">Watching:</span>
+          <div class="seg" id="focus-buttons" role="group" aria-label="Which game the brain view shows"></div>
+        </div>
+      </div>
+      <p class="explain">The signal flows left to right. <b>Input</b>: the 8 layers of the board the network sees. <b>Conv 1/2</b>: feature maps, brighter = that filter found its pattern there. <b>Hidden</b>: 128 neurons combining everything. <b>Output</b>: one probability per move plus the value (how good the situation looks). Lines show the hidden neurons pushing hardest for the chosen move: blue pushes for it, red against. Hover anything for details.</p>
+      <div class="brain-wrap">
+        <canvas id="brain-canvas" class="brain-canvas" role="img" aria-label="Live visualization of the neural network's activations"></canvas>
+        <div id="brain-tooltip" class="tooltip" hidden></div>
+      </div>
+    </section>
+
+    <!-- Brain internals -->
+    <section class="row three">
+      <div class="panel">
+        <div class="panel-head"><h2>What conv 1 looks for</h2></div>
+        <p class="explain">Each 3×3 tile is one learned filter applied to one board layer. Red = "I like this object here", blue = "I don't". They start as noise and turn into edge and position detectors.</p>
+        <canvas id="filters-canvas" class="small-canvas" role="img" aria-label="First-layer convolution filters"></canvas>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Weight distributions</h2></div>
+        <p class="explain">A histogram of every weight in each layer. Watch them spread out as the network learns. A collapse to zero or runaway growth is a warning sign.</p>
+        <canvas id="hist-canvas" class="small-canvas" role="img" aria-label="Histograms of weights per layer"></canvas>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Layer health</h2></div>
+        <p class="explain">Gradient size (how hard each layer is being pushed this update) and relative weight change (how much it actually moved). Layers that stop moving are losing plasticity.</p>
+        <table class="health" aria-label="Per-layer gradient and weight statistics">
+          <thead><tr><th scope="col">Layer</th><th scope="col">Gradient</th><th scope="col">Δ weights</th><th scope="col">‖W‖</th></tr></thead>
+          <tbody id="health-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Training arena -->
+    <section class="panel" id="panel-arena">
+      <div class="panel-head"><h2>Training arena <span class="tag" id="arena-count">0 games</span></h2></div>
+      <p class="explain">These are the actual games the trainer is learning from right now, all running in parallel. At full speed they flicker by; use slow-motion above to follow them. The number under each is the probability of the move it just sampled.</p>
+      <div id="arena" class="arena"></div>
+    </section>
+
+    <!-- Charts -->
+    <section class="charts" id="charts"></section>
+
+    <!-- Settings, log, checkpoints -->
+    <section class="row three">
+      <div class="panel">
+        <div class="panel-head"><h2>Hyperparameters</h2></div>
+        <p class="explain">Settings chosen before training. Changing them builds a fresh network, so the current one is thrown away (save it first).</p>
+        <form id="config-form" class="config-form"></form>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Event log</h2></div>
+        <ul id="events" class="events" aria-live="polite"></ul>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Checkpoints</h2><button id="btn-refresh" class="btn small" type="button">Refresh</button></div>
+        <p class="explain">Saved brains in <code>results/</code>. Load one to watch it play (pause training first).</p>
+        <ul id="checkpoints" class="checkpoints"></ul>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="alert" hidden></div>
+
+  <script src="/js/charts.js"></script>
+  <script src="/js/games.js"></script>
+  <script src="/js/brain.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
