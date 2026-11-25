@@ -1,0 +1,40 @@
+{
+  "id": "train_20261125-105130_s0",
+  "kind": "run",
+  "created": "2026-11-25 10:51:30",
+  "notes": "",
+  "games": [
+    "catch",
+    "reach"
+  ],
+  "config": {
+    "games": [
+      "catch",
+      "reach"
+    ],
+    "envs_per_game": 4,
+    "total_steps": 600000,
+    "rollout_steps": 128,
+    "lr": 0.0005,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "epochs": 4,
+    "minibatches": 4,
+    "clip": 0.2,
+    "vf_coef": 0.5,
+    "ent_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "seed": 0,
+    "save_path": "results/multigame_small.pt"
+  },
+  "params": 109239,
+  "status": "finished",
+  "update": 585,
+  "num_updates": 585,
+  "env_steps": 599040,
+  "minutes": 13.41,
+  "scores": {
+    "catch": 0.98,
+    "reach": 0.9397999999999999
+  }
+}

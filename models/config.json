@@ -1,0 +1,20 @@
+{
+  "games": [
+    "catch",
+    "reach"
+  ],
+  "envs_per_game": 4,
+  "total_steps": 600000,
+  "rollout_steps": 128,
+  "lr": 0.0005,
+  "gamma": 0.99,
+  "lam": 0.95,
+  "epochs": 4,
+  "minibatches": 4,
+  "clip": 0.2,
+  "vf_coef": 0.5,
+  "ent_coef": 0.01,
+  "max_grad_norm": 0.5,
+  "seed": 0,
+  "save_path": "results/multigame_small.pt"
+}
