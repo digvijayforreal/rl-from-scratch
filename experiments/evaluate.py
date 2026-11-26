@@ -64,9 +64,10 @@ def evaluate_policy(net, game, episodes=200, seed=999, mode="greedy", policy="mo
 
 
 def main(path="results/multigame_small.pt", episodes=200):
-    net, _ = load_model(path)
+    net, saved = load_model(path)
+    games = saved.get("config", {}).get("games") or list(GAMES)  # the games it was trained on
     print(f"{'game':<8}{'random':>10}{'trained':>10}")
-    for name in GAMES:
+    for name in games:
         random_score = evaluate_policy(net, name, episodes, policy="random")["returns"].mean()
         trained_score = evaluate_policy(net, name, episodes)["returns"].mean()
         print(f"{name:<8}{random_score:>10.2f}{trained_score:>10.2f}")

@@ -5,11 +5,14 @@
 const Games = (() => {
   const GRID = 10;
   const NOOP = 0, UP = 1, RIGHT = 2, DOWN = 3, LEFT = 4;
-  const COLORS = { catch: "#ffb020", reach: "#22d3ee" };
-  const TITLES = { catch: "Catch", reach: "Reach" };
+  const COLORS = { catch: "#ffb020", reach: "#22d3ee", maze: "#f472b6", snake: "#4ade80" };
+  const TITLES = { catch: "Catch", reach: "Reach", maze: "Maze", snake: "Snake" };
+  const SNAKE_FOODS = 5; // food to eat to win (matches envs/snake.py)
   const DESCRIPTIONS = {
     catch: "A ball falls from the top. Slide the paddle under it. +1 catch, −1 miss.",
     reach: "Walk to the star. Start and goal are random every episode. +1 at the goal, −0.01 per step.",
+    maze: "Walk to the star around the walls. The maze is different every episode. +1 at the goal, −0.01 per step.",
+    snake: "Eat 5 apples to win (+0.2 each, −0.01 per other step). Hitting a wall or your own body ends the game with −1.",
   };
   const DIRS = { [UP]: [-1, 0], [RIGHT]: [0, 1], [DOWN]: [1, 0], [LEFT]: [0, -1] };
 
@@ -260,6 +263,24 @@ const Games = (() => {
       }
     }
 
+    // walls (only the Maze has them)
+    if (s.walls) {
+      for (const [wr, wc] of s.walls) {
+        const x = wc * c, y = wr * c;
+        const wall = ctx.createLinearGradient(x, y, x, y + c);
+        wall.addColorStop(0, "#43306b");
+        wall.addColorStop(1, "#1f1636");
+        ctx.fillStyle = wall;
+        ctx.beginPath();
+        ctx.roundRect(x + 1, y + 1, c - 2, c - 2, Math.max(2, c * 0.14));
+        ctx.fill();
+        if (!o.mini) {
+          ctx.fillStyle = "rgba(244, 114, 182, 0.22)";
+          ctx.fillRect(x + c * 0.14, y + 2, c * 0.72, 2);
+        }
+      }
+    }
+
     const gx = (s.gc + 0.5) * c, gy = (s.gr + 0.5) * c;
     const ax = (s.ac + 0.5) * c, ay = (s.ar + 0.5) * c;
 
@@ -281,7 +302,7 @@ const Games = (() => {
       });
     }
 
-    if (!o.mini) {
+    if (!o.mini && !s.walls) { // a straight guide line would be misleading with walls in the way
       ctx.save();
       ctx.setLineDash([4, 6]);
       ctx.lineDashOffset = -o.time * 0.02;
@@ -349,9 +370,118 @@ const Games = (() => {
     }
   }
 
+  // ---------- Maze (Reach with walls) ----------
+  function mazeScene(state) {
+    return { ...reachScene(state), walls: state.walls };
+  }
+
+  // ---------- Snake ----------
+  function snakeScene(state) {
+    return { hr: state.body[0][0], hc: state.body[0][1], fr: state.food[0], fc: state.food[1],
+      eaten: state.eaten, body: state.body };
+  }
+
+  function drawSnake(ctx, S, s, o) {
+    const c = S / GRID;
+    ctx.fillStyle = "#04120d";
+    ctx.fillRect(0, 0, S, S);
+    for (let r = 0; r < GRID; r++) {
+      for (let col = 0; col < GRID; col++) {
+        ctx.fillStyle = (r + col) % 2 ? "#0b2018" : "#081811";
+        ctx.fillRect(col * c + 1, r * c + 1, c - 2, c - 2);
+      }
+    }
+    // the edge is deadly
+    ctx.strokeStyle = "rgba(248, 113, 113, 0.55)";
+    ctx.lineWidth = Math.max(2, c * 0.07);
+    ctx.strokeRect(1, 1, S - 2, S - 2);
+
+    // food
+    const fx = (s.fc + 0.5) * c, fy = (s.fr + 0.5) * c;
+    const pulse = 0.5 + 0.5 * Math.sin(o.time * 0.006);
+    const halo = ctx.createRadialGradient(fx, fy, 0, fx, fy, c * 2);
+    halo.addColorStop(0, "rgba(251, 113, 133, 0.25)");
+    halo.addColorStop(1, "rgba(251, 113, 133, 0)");
+    ctx.fillStyle = halo;
+    ctx.fillRect(0, 0, S, S);
+    ctx.save();
+    ctx.shadowColor = "#fb7185";
+    ctx.shadowBlur = o.mini ? 6 : 14 + 10 * pulse;
+    const apple = ctx.createRadialGradient(fx - c * 0.08, fy - c * 0.1, 0, fx, fy, c * 0.3);
+    apple.addColorStop(0, "#fecdd3");
+    apple.addColorStop(0.5, "#fb7185");
+    apple.addColorStop(1, "#be123c");
+    ctx.fillStyle = apple;
+    ctx.beginPath();
+    ctx.arc(fx, fy, c * (0.25 + 0.02 * pulse), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // body: the head slides smoothly, the other segments sit on their cells
+    const pts = [[(s.hc + 0.5) * c, (s.hr + 0.5) * c]];
+    for (const p of s.body.slice(1)) pts.push([(p[1] + 0.5) * c, (p[0] + 0.5) * c]);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (let i = pts.length - 1; i >= 1; i--) {
+      const t = 1 - i / pts.length; // 1 near the head, near 0 at the tail
+      ctx.strokeStyle = `hsl(145, 65%, ${20 + 28 * t}%)`;
+      ctx.lineWidth = c * (0.44 + 0.12 * t);
+      ctx.beginPath();
+      ctx.moveTo(pts[i][0], pts[i][1]);
+      ctx.lineTo(pts[i - 1][0], pts[i - 1][1]);
+      ctx.stroke();
+    }
+
+    // head with eyes that look where it is going
+    const hx = pts[0][0], hy = pts[0][1], hr = c * 0.34;
+    ctx.save();
+    ctx.shadowColor = "#4ade80";
+    ctx.shadowBlur = o.mini ? 5 : 18;
+    const head = ctx.createRadialGradient(hx - hr * 0.3, hy - hr * 0.35, hr * 0.1, hx, hy, hr);
+    head.addColorStop(0, "#ecfccb");
+    head.addColorStop(0.45, "#4ade80");
+    head.addColorStop(1, "#15803d");
+    ctx.fillStyle = head;
+    ctx.beginPath();
+    ctx.arc(hx, hy, hr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    if (!o.mini) {
+      const [dy, dx] = o.dir || [0, 1];
+      for (const side of [-1, 1]) {
+        const ex = hx + dx * hr * 0.35 + -dy * side * hr * 0.35;
+        const ey = hy + dy * hr * 0.35 + dx * side * hr * 0.35 - hr * 0.1;
+        ctx.fillStyle = "#fff";
+        ctx.beginPath(); ctx.arc(ex, ey, hr * 0.2, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#052e16";
+        ctx.beginPath(); ctx.arc(ex + dx * hr * 0.08, ey + dy * hr * 0.08, hr * 0.1, 0, Math.PI * 2); ctx.fill();
+      }
+      // progress: apples eaten out of the 5 needed to win
+      const eaten = Math.round(s.eaten);
+      for (let i = 0; i < SNAKE_FOODS; i++) {
+        ctx.fillStyle = i < eaten ? "#fb7185" : "rgba(148, 163, 184, 0.25)";
+        ctx.beginPath();
+        ctx.arc(c * 0.35 + i * c * 0.26, c * 0.3, c * 0.075, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // the agent's intentions
+    if (o.probs && !o.mini) {
+      for (const a of [UP, RIGHT, DOWN, LEFT]) {
+        const p = o.probs[a] || 0;
+        const [dy, dx] = DIRS[a];
+        arrow(ctx, hx + dx * hr * 1.05, hy + dy * hr * 1.05, Math.atan2(dy, dx), c * (0.15 + 0.55 * p),
+          c * 0.15, "#bbf7d0", 0.15 + 0.85 * p, o.action === a);
+      }
+    }
+  }
+
   const SCENES = {
     catch: { toScene: catchScene, draw: drawCatch },
     reach: { toScene: reachScene, draw: drawReach },
+    maze: { toScene: mazeScene, draw: drawReach },
+    snake: { toScene: snakeScene, draw: drawSnake },
   };
 
   // ---------- live renderer with smooth movement and effects ----------
@@ -378,7 +508,7 @@ const Games = (() => {
       this.t0 = performance.now();
       this.dur = frame.reset ? 0 : Math.min(intervalMs * 0.85, 350);
       if (frame.reset) { this.trail = []; this.ballTrail = []; }
-      if (this.game === "reach" && !frame.reset) {
+      if ((this.game === "reach" || this.game === "maze") && !frame.reset) {
         this.trail.push(frame.prev.agent);
         if (this.trail.length > 40) this.trail.shift();
       }
@@ -388,6 +518,12 @@ const Games = (() => {
 
     _trigger(event, S) {
       const c = S / GRID, st = this.frame.state;
+      if (event === "timeout") {
+        this.flash = 0.6;
+        this.flashColor = "148,163,196";
+        this.particles.text(S / 2, S / 2, "time up", "#cbd5e1");
+        return;
+      }
       if (this.game === "catch") {
         const x = (st.paddle + 0.5) * c, y = (GRID - 1) * c + c * 0.4;
         if (event === "catch") {
@@ -400,15 +536,26 @@ const Games = (() => {
           this.particles.burst((st.ball[1] + 0.5) * c, y, "#f87171", 24, 3.5, 3);
           this.particles.text((st.ball[1] + 0.5) * c, y - c * 0.8, "−1", "#f87171");
         }
-      } else if (this.game === "reach") {
+      } else if (this.game === "reach" || this.game === "maze") {
         const gx = (st.goal[1] + 0.5) * c, gy = (st.goal[0] + 0.5) * c;
         if (event === "goal") {
           this.particles.confetti(gx, gy, 46);
           this.particles.text(gx, gy - c * 0.6, "+1", "#fde047");
-        } else if (event === "timeout") {
-          this.flash = 0.6;
-          this.flashColor = "148,163,196";
-          this.particles.text(S / 2, S / 2, "time up", "#cbd5e1");
+        }
+      } else if (this.game === "snake") {
+        const x = (st.body[0][1] + 0.5) * c, y = (st.body[0][0] + 0.5) * c;
+        if (event === "food") {
+          this.particles.burst(x, y, "#fb7185", 22, 4, 3);
+          this.particles.text(x, y - c * 0.7, "+0.2", "#fb7185");
+        } else if (event === "win") {
+          this.particles.confetti(x, y, 46);
+          this.particles.text(x, y - c * 0.7, "+0.2", "#fb7185");
+          this.particles.text(S / 2, S * 0.4, "WIN", "#fde047");
+        } else if (event === "crash") {
+          this.flash = 1;
+          this.flashColor = "248,113,113";
+          this.particles.burst(x, y, "#f87171", 28, 4, 3);
+          this.particles.text(x, y - c * 0.7, "−1", "#f87171");
         }
       }
     }
@@ -431,7 +578,8 @@ const Games = (() => {
       const e = easeOut(t);
       const a = this.scene.toScene(this.frame.prev), b = this.scene.toScene(this.frame.state);
       const s = {};
-      for (const k of Object.keys(b)) s[k] = lerp(a[k], b[k], e);
+      // numbers slide smoothly between the two moments; lists (walls, snake body) are taken as they are
+      for (const k of Object.keys(b)) s[k] = typeof b[k] === "number" ? lerp(a[k], b[k], e) : b[k];
 
       if (this.game === "catch") {
         this.ballTrail.push([s.ballR, s.ballC]);

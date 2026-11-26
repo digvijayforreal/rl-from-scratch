@@ -36,12 +36,14 @@ def load_brain(trainer, name):
         _, weights = trainer.weights
         net.load_state_dict(weights)
         label = "Live brain (current training)"
+        trained = list(trainer.games)
     else:
         saved = torch.load(storage.resolve_checkpoint(name), weights_only=True)
         net.load_state_dict(saved["model"])
         label = str(name)
+        trained = saved.get("config", {}).get("games") or list(GAMES)
     net.eval()
-    return net, label
+    return net, label, trained
 
 
 def _stats(res):
@@ -56,12 +58,13 @@ def evaluate_brain(trainer, name, episodes=200, mode="greedy", seed=999):
     episodes = _int(episodes, 10, 1000, "episodes")
     seed = _int(seed, 0, 1_000_000, "seed")
     mode = _mode(mode)
-    net, label = load_brain(trainer, name)
+    net, label, trained = load_brain(trainer, name)
     games = {}
     for g in GAMES:
         model = evaluate_policy(net, g, episodes, seed, mode)
         rand = evaluate_policy(net, g, episodes, seed, policy="random")  # same games, random moves
-        games[g] = {"model": _stats(model), "random": _stats(rand), "optimal": optimal_score(g)}
+        games[g] = {"model": _stats(model), "random": _stats(rand), "optimal": optimal_score(g),
+                    "trained": g in trained}
     return clean({"label": label, "episodes": episodes, "mode": mode, "seed": seed,
                   "hist_range": HIST_RANGE, "bins": HIST_BINS, "games": games})
 
@@ -71,7 +74,7 @@ def record_episode(trainer, name, game, seed=0, mode="greedy"):
         raise ValueError(f"Unknown game {game!r}")
     seed = _int(seed, 0, 1_000_000, "seed")
     mode = _mode(mode)
-    net, label = load_brain(trainer, name)
+    net, label, _ = load_brain(trainer, name)
     env = GAMES[game](seed=seed)
     obs = env.reset()
     mask = to_tensor(env.action_mask()[None], torch.bool)

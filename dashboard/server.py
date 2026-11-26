@@ -20,7 +20,7 @@ from dashboard import lab, storage
 from dashboard.jobs import JobQueue, experiment_detail
 from dashboard.trainer import Showcase, Trainer, clean, init_payload
 from experiments.plasticity import DEFAULT_SPEC, INTERVENTIONS, QUICK_SPEC, SPEC_LIMITS
-from experiments.train import GAMES
+from experiments.train import CONFIG, GAMES
 
 STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -214,7 +214,11 @@ def main():
     parser = argparse.ArgumentParser(description="RL research lab")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--games", nargs="+", choices=list(GAMES), default=None,
+                        help="games to train on (default: catch reach)")
     args = parser.parse_args()
+    if args.games:
+        CONFIG["games"] = list(dict.fromkeys(args.games))  # in order, no repeats
 
     print("Measuring random baselines and building the network...")
     Handler.trainer = Trainer()

@@ -78,13 +78,15 @@
       const m = d.model, rnd = d.random;
       const skill = d.optimal !== null ? (m.mean - rnd.mean) / (d.optimal - rnd.mean) : null;
       const tr = el("tr");
-      tr.innerHTML = `<td><span class="swatch" style="background:${Games.color(g)}"></span>${title(g)}</td>
+      const untrained = d.trained === false;
+      tr.innerHTML = `<td><span class="swatch" style="background:${Games.color(g)}"></span>${title(g)}${untrained ? ' <span class="ci">(never trained on)</span>' : ""}</td>
         <td>${fmtSigned(m.mean)} <span class="ci">± ${m.std.toFixed(2)}</span></td>
         <td>${pct(m.success)}</td><td>${m.length.toFixed(1)} moves</td>
         <td>${fmtSigned(rnd.mean)} <span class="ci">(${pct(rnd.success)} wins)</span></td>
         <td>${fmtSigned(d.optimal)}</td>
         <td><span class="skill">${pct(skill)}</span><span class="skill-bar"><i style="width:${Math.max(0, Math.min(1, skill ?? 0)) * 100}%"></i></span></td>`;
       body.append(tr);
+      if (untrained) { verdicts.push(`${title(g)}: this brain never trained on it.`); continue; }
       verdicts.push(skill === null ? `${title(g)}: no perfect score to compare with.`
         : skill >= 0.95 ? `${title(g)}: plays essentially perfectly.`
         : skill >= 0.6 ? `${title(g)}: clearly skilled, with room to improve.`
